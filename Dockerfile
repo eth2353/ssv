@@ -32,7 +32,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,mode=0755,target=/go/pkg \
   go mod download
 
-ARG APP_VERSION
+ARG VERSION
+ARG COMMIT
 #
 # STEP 2: Build executable binary
 #
@@ -43,11 +44,9 @@ COPY . .
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,mode=0755,target=/go/pkg \
-  COMMIT=$(git rev-parse HEAD) && \
-  VERSION=$(git describe --tags $(git rev-list --tags --max-count=1)) && \
   CGO_ENABLED=1 GOOS=linux go install \
   -tags="blst_enabled,jemalloc,allocator" \
-  -ldflags "-X main.Commit=$COMMIT -X main.Version=$VERSION -linkmode external -extldflags \"-static -lm\"" \
+  -ldflags "-X main.Commit=${COMMIT} -X main.Version=${VERSION} -linkmode external -extldflags \"-static -lm\"" \
   ./cmd/ssvnode
 
 #
