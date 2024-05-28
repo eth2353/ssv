@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
 	specqbft "github.com/bloxapp/ssv-spec/qbft"
 	specssv "github.com/bloxapp/ssv-spec/ssv"
@@ -30,6 +31,8 @@ type AttesterRunner struct {
 
 	started time.Time
 	metrics metrics.ConsensusMetrics
+
+	attDataCache map[phase0.Slot]*phase0.AttestationData
 }
 
 func NewAttesterRunnner(
@@ -57,6 +60,8 @@ func NewAttesterRunnner(
 		valCheck: valCheck,
 
 		metrics: metrics.NewConsensusMetrics(spectypes.BNRoleAttester),
+
+		attDataCache: make(map[phase0.Slot]*phase0.AttestationData),
 	}
 }
 
@@ -218,10 +223,34 @@ func (r *AttesterRunner) expectedPostConsensusRootsAndDomain() ([]ssz.HashRoot, 
 // 4) collect 2f+1 partial sigs, reconstruct and broadcast valid attestation sig to the BN
 func (r *AttesterRunner) executeDuty(logger *zap.Logger, duty *spectypes.Duty) error {
 	start := time.Now()
-	attData, ver, err := r.GetBeaconNode().GetAttestationData(duty.Slot, duty.CommitteeIndex)
-	if err != nil {
-		return errors.Wrap(err, "failed to get attestation data")
+	cachedAttData, exists := r.attDataCache[duty.Slot]
+
+	var attData *phase0.AttestationData
+	var err error
+
+	if !exists {
+        logger.Info("Cache miss: fetching attestation data from beacon node", zap.Uint64("slot", uint64(duty.Slot)))
+		var marshaler ssz.Marshaler
+		marshaler, _, err = r.GetBeaconNode().GetAttestationData(duty.Slot, duty.CommitteeIndex)
+		if err != nil {
+			return errors.Wrap(err, "failed to get attestation data")
+		}
+
+		// Perform a type assertion
+		retrievedAttData, ok := marshaler.(*phase0.AttestationData)
+		if !ok {
+			return errors.New("unexpected type for attestation data")
+		}
+		attData = retrievedAttData
+
+		r.attDataCache[duty.Slot] = attData
+	} else {
+	    logger.Info("Cache hit: using cached attestation data", zap.Uint64("slot", uint64(duty.Slot)))
+		attData = cachedAttData
 	}
+	// Cached attestation data may have wrong committee index
+	attData.Index = duty.CommitteeIndex
+
 	logger = logger.With(zap.Duration("attestation_data_time", time.Since(start)))
 
 	r.started = time.Now()
@@ -236,7 +265,7 @@ func (r *AttesterRunner) executeDuty(logger *zap.Logger, duty *spectypes.Duty) e
 
 	input := &spectypes.ConsensusData{
 		Duty:    *duty,
-		Version: ver,
+		Version: spec.DataVersionPhase0,
 		DataSSZ: attDataByts,
 	}
 
