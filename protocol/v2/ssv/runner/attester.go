@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/attestantio/go-eth2-client/spec"
@@ -21,6 +22,40 @@ import (
 	"github.com/bloxapp/ssv/protocol/v2/ssv/runner/metrics"
 )
 
+type AttestationDataCache struct {
+	data map[phase0.Slot]*CacheEntry
+	mu   sync.Mutex
+}
+
+type CacheEntry struct {
+	Data     *phase0.AttestationData
+	Ready    chan struct{} // closed when data is fetched
+	Fetching bool          // indicates if the fetch is in progress
+}
+
+func NewAttestationDataCache() *AttestationDataCache {
+	return &AttestationDataCache{
+		data: make(map[phase0.Slot]*CacheEntry),
+	}
+}
+
+// GetOrCreateEntry gets or creates a cache entry for the slot.
+func (c *AttestationDataCache) GetOrCreateEntry(slot phase0.Slot) *CacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry, exists := c.data[slot]; exists {
+		return entry
+	}
+
+	// Create a new entry if one does not exist
+	entry := &CacheEntry{
+		Ready: make(chan struct{}),
+	}
+	c.data[slot] = entry
+	return entry
+}
+
 type AttesterRunner struct {
 	BaseRunner *BaseRunner
 
@@ -32,7 +67,7 @@ type AttesterRunner struct {
 	started time.Time
 	metrics metrics.ConsensusMetrics
 
-	attDataCache map[phase0.Slot]*phase0.AttestationData
+	attDataCache *AttestationDataCache
 }
 
 func NewAttesterRunnner(
@@ -44,6 +79,7 @@ func NewAttesterRunnner(
 	signer spectypes.KeyManager,
 	valCheck specqbft.ProposedValueCheckF,
 	highestDecidedSlot phase0.Slot,
+	attDataCache *AttestationDataCache,
 ) Runner {
 	return &AttesterRunner{
 		BaseRunner: &BaseRunner{
@@ -61,7 +97,7 @@ func NewAttesterRunnner(
 
 		metrics: metrics.NewConsensusMetrics(spectypes.BNRoleAttester),
 
-		attDataCache: make(map[phase0.Slot]*phase0.AttestationData),
+		attDataCache: attDataCache,
 	}
 }
 
@@ -223,33 +259,63 @@ func (r *AttesterRunner) expectedPostConsensusRootsAndDomain() ([]ssz.HashRoot, 
 // 4) collect 2f+1 partial sigs, reconstruct and broadcast valid attestation sig to the BN
 func (r *AttesterRunner) executeDuty(logger *zap.Logger, duty *spectypes.Duty) error {
 	start := time.Now()
-	cachedAttData, exists := r.attDataCache[duty.Slot]
+
+	// Get or create cache entry
+	cacheEntry := r.attDataCache.GetOrCreateEntry(duty.Slot)
 
 	var attData *phase0.AttestationData
 	var err error
 
-	if !exists {
-        logger.Info("Cache miss: fetching attestation data from beacon node", zap.Uint64("slot", uint64(duty.Slot)))
-		var marshaler ssz.Marshaler
-		marshaler, _, err = r.GetBeaconNode().GetAttestationData(duty.Slot, duty.CommitteeIndex)
-		if err != nil {
-			return errors.Wrap(err, "failed to get attestation data")
+	// Check if the data is already being fetched
+	select {
+	case <-cacheEntry.Ready:
+		// Data is ready, use it
+		attData = cacheEntry.Data
+		if attData == nil {
+			return errors.New("failed to get attestation data from cache")
 		}
+		logger.Info("Cache hit: using cached attestation data", zap.Uint64("slot", uint64(duty.Slot)))
+	default:
+		if !cacheEntry.Fetching {
+			// Mark as fetching and fetch the data
+			cacheEntry.Fetching = true
+			logger.Info("Cache miss: fetching attestation data from beacon node", zap.Uint64("slot", uint64(duty.Slot)))
+			go func() {
+				defer close(cacheEntry.Ready)
+				var marshaler ssz.Marshaler
+				marshaler, _, err = r.GetBeaconNode().GetAttestationData(duty.Slot, duty.CommitteeIndex)
+				if err != nil {
+					logger.Error("Failed to fetch attestation data", zap.Error(err))
+					return
+				}
 
-		// Perform a type assertion
-		retrievedAttData, ok := marshaler.(*phase0.AttestationData)
-		if !ok {
-			return errors.New("unexpected type for attestation data")
+				retrievedAttData, ok := marshaler.(*phase0.AttestationData)
+				if !ok {
+					logger.Error("Unexpected type for attestation data")
+					return
+				}
+
+				// Store in cache
+				cacheEntry.Data = retrievedAttData
+			}()
+			logger.Info("Cache miss: done fetching attestation data from beacon node", zap.Uint64("slot", uint64(duty.Slot)))
+			<-cacheEntry.Ready // Wait for the data to be fetched
+			attData = cacheEntry.Data
+			attData.Index = duty.CommitteeIndex
+			if attData == nil {
+				return errors.New("failed to get attestation data after fetching")
+			}
+		} else {
+			logger.Info("Cache miss: waiting for ongoing fetch to complete", zap.Uint64("slot", uint64(duty.Slot)))
+			<-cacheEntry.Ready // Wait if another goroutine is fetching
+			logger.Info("Cache miss: ongoing fetch complete, continuing", zap.Uint64("slot", uint64(duty.Slot)))
+			attData = cacheEntry.Data
+			attData.Index = duty.CommitteeIndex
+			if attData == nil {
+				return errors.New("failed to get attestation data from cache after waiting")
+			}
 		}
-		attData = retrievedAttData
-
-		r.attDataCache[duty.Slot] = attData
-	} else {
-	    logger.Info("Cache hit: using cached attestation data", zap.Uint64("slot", uint64(duty.Slot)))
-		attData = cachedAttData
 	}
-	// Cached attestation data may have wrong committee index
-	attData.Index = duty.CommitteeIndex
 
 	logger = logger.With(zap.Duration("attestation_data_time", time.Since(start)))
 

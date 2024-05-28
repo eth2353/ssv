@@ -145,6 +145,8 @@ type controller struct {
 	logger  *zap.Logger
 	metrics validator.Metrics
 
+	attDataCache *runner.AttestationDataCache
+
 	sharesStorage     SharesStorage
 	operatorsStorage  registrystorage.Operators
 	recipientsStorage Recipients
@@ -224,9 +226,12 @@ func NewController(logger *zap.Logger, options ControllerOptions) Controller {
 		metrics = options.Metrics
 	}
 
+	attDataCache := runner.NewAttestationDataCache()
+
 	ctrl := controller{
 		logger:            logger.Named(logging.NameController),
 		metrics:           metrics,
+		attDataCache:      attDataCache,
 		sharesStorage:     options.RegistryStorage.Shares(),
 		operatorsStorage:  options.RegistryStorage,
 		recipientsStorage: options.RegistryStorage,
@@ -720,7 +725,7 @@ func (c *controller) onShareInit(share *ssvtypes.SSVShare) (*validator.Validator
 
 		opts := c.validatorOptions
 		opts.SSVShare = share
-		opts.DutyRunners = SetupRunners(ctx, c.logger, opts)
+		opts.DutyRunners = SetupRunners(ctx, c.logger, opts, c.attDataCache)
 
 		v = validator.NewValidator(ctx, cancel, opts)
 		c.validatorsMap.CreateValidator(hex.EncodeToString(share.ValidatorPubKey), v)
@@ -856,7 +861,7 @@ func (c *controller) UpdateValidatorMetaDataLoop() {
 }
 
 // SetupRunners initializes duty runners for the given validator
-func SetupRunners(ctx context.Context, logger *zap.Logger, options validator.Options) runner.DutyRunners {
+func SetupRunners(ctx context.Context, logger *zap.Logger, options validator.Options, attDataCache *runner.AttestationDataCache) runner.DutyRunners {
 	if options.SSVShare == nil || options.SSVShare.BeaconMetadata == nil {
 		logger.Error("missing validator metadata", zap.String("validator", hex.EncodeToString(options.SSVShare.ValidatorPubKey)))
 		return runner.DutyRunners{} // TODO need to find better way to fix it
@@ -903,7 +908,7 @@ func SetupRunners(ctx context.Context, logger *zap.Logger, options validator.Opt
 		case spectypes.BNRoleAttester:
 			valCheck := specssv.AttesterValueCheckF(options.Signer, options.BeaconNetwork.GetBeaconNetwork(), options.SSVShare.Share.ValidatorPubKey, options.SSVShare.BeaconMetadata.Index, options.SSVShare.SharePubKey)
 			qbftCtrl := buildController(spectypes.BNRoleAttester, valCheck)
-			runners[role] = runner.NewAttesterRunnner(options.BeaconNetwork.GetBeaconNetwork(), &options.SSVShare.Share, qbftCtrl, options.Beacon, options.Network, options.Signer, valCheck, 0)
+			runners[role] = runner.NewAttesterRunnner(options.BeaconNetwork.GetBeaconNetwork(), &options.SSVShare.Share, qbftCtrl, options.Beacon, options.Network, options.Signer, valCheck, 0, attDataCache)
 		case spectypes.BNRoleProposer:
 			proposedValueCheck := specssv.ProposerValueCheckF(options.Signer, options.BeaconNetwork.GetBeaconNetwork(), options.SSVShare.Share.ValidatorPubKey, options.SSVShare.BeaconMetadata.Index, options.SSVShare.SharePubKey)
 			qbftCtrl := buildController(spectypes.BNRoleProposer, proposedValueCheck)
