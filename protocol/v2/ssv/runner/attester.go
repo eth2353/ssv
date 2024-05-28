@@ -34,9 +34,39 @@ type CacheEntry struct {
 }
 
 func NewAttestationDataCache() *AttestationDataCache {
-	return &AttestationDataCache{
-		data: make(map[phase0.Slot]*CacheEntry),
-	}
+    cache := &AttestationDataCache{
+        data: make(map[phase0.Slot]*CacheEntry),
+    }
+    go cache.cleanupRoutine()
+    return cache
+}
+
+func (c *AttestationDataCache) cleanupRoutine() {
+    ticker := time.NewTicker(10 * time.Minute)
+    for {
+        <-ticker.C
+        c.cleanup()
+    }
+}
+
+func (c *AttestationDataCache) cleanup() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+
+    // Find the maximum slot key
+    var maxSlot phase0.Slot
+    for slot := range c.data {
+        if slot > maxSlot {
+            maxSlot = slot
+        }
+    }
+
+    // Remove all entries except for recent ones (age >10 slot)
+    for slot := range c.data {
+        if slot < (maxSlot - 10) {
+            delete(c.data, slot)
+        }
+    }
 }
 
 // GetOrCreateEntry gets or creates a cache entry for the slot.
